@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Leitor e gravador NFC</title>
+<style>
+:root{--bg:#f6f7f9;--fg:#15181d;--card:#fff;--muted:#5b6472;--line:#d5dae1;--accent:#0b63ce;--accent-fg:#fff;--ok:#0f7a3a;--err:#b3261e;--warn:#8a5a00}
+@media (prefers-color-scheme:dark){:root{--bg:#101318;--fg:#e8ebf0;--card:#1a1f27;--muted:#9aa4b2;--line:#303744;--accent:#5aa2ff;--accent-fg:#06121f;--ok:#5fd08a;--err:#ff8a80;--warn:#f2c066}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.45 system-ui,sans-serif}
+main{max-width:560px;margin:0 auto;padding:12px 12px 32px}
+h1{font-size:1.25rem;margin:8px 0 12px}
+#status{position:sticky;top:0;z-index:2;margin:0 0 12px;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);min-height:48px}
+#status.ok{color:var(--ok);border-color:var(--ok)}
+#status.err{color:var(--err);border-color:var(--err)}
+button,input,select,textarea{font:inherit;color:inherit;min-height:48px;width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card)}
+button{cursor:pointer;font-weight:600}
+button.primary,[role=tab][aria-selected=true]{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:not-allowed}
+textarea{min-height:96px;resize:vertical}
+label{display:block;margin:12px 0 4px;font-size:.9rem;color:var(--muted)}
+.check{display:flex;align-items:center;gap:10px;color:var(--fg);font-size:1rem}
+.check input{width:24px;height:24px;min-height:0;flex:none}
+.row{display:flex;gap:8px;margin-top:12px}
+.row>*{flex:1}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:12px}
+.rec{border-top:1px solid var(--line);padding-top:8px;margin-top:8px}
+.k{color:var(--muted);font-size:.85rem;margin-top:6px}
+.v{white-space:pre-wrap;word-break:break-word}
+.v a{color:var(--accent)}
+.item{display:flex;gap:8px;align-items:center;margin-top:8px}
+.item span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item button{width:auto}
+#estimativa{margin:12px 0;color:var(--muted)}
+#estimativa.warn{color:var(--warn);font-weight:600}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>Leitor e gravador NFC</h1>
+  <div id="status" role="status" aria-live="polite"></div>
+
+  <div class="tabs" role="tablist">
+    <button type="button" role="tab" id="tab-ler" aria-selected="true" aria-controls="painel-ler">Ler</button>
+    <button type="button" role="tab" id="tab-gravar" aria-selected="false" aria-controls="painel-gravar">Gravar</button>
+  </div>
+
+  <section id="painel-ler" role="tabpanel" aria-labelledby="tab-ler">
+    <div class="row">
+      <button type="button" id="btn-ler" class="primary">Ler tag</button>
+      <button type="button" id="btn-parar" disabled>Parar</button>
+    </div>
+    <div id="resultado"></div>
+  </section>
+
+  <section id="painel-gravar" role="tabpanel" aria-labelledby="tab-gravar" hidden>
+    <label for="tipo">Tipo de conteúdo</label>
+    <select id="tipo"></select>
+    <div id="campos"></div>
+    <div class="row">
+      <button type="button" id="btn-add">Adicionar outro registro</button>
+    </div>
+    <div id="lista"></div>
+    <p id="estimativa"></p>
+    <label class="check"><input type="checkbox" id="overwrite" checked> Sobrescrever conteúdo existente</label>
+    <div class="row">
+      <button type="button" id="btn-gravar" class="primary">Gravar</button>
+      <button type="button" id="btn-cancelar" disabled>Cancelar</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const LIMITE_BYTES = 130;
+const enc = new TextEncoder();
+
+const fone = (raw) => {
+  const d = raw.replace(/\D/g, "");
+  if (!d) throw new Error("Informe o telefone.");
+  const internacional = raw.trim().startsWith("+") || (d.startsWith("55") && d.length >= 12);
+  const completo = internacional ? d : "55" + d;
+  const ok = completo.startsWith("55") ? /^55\d{10,11}$/.test(completo) : completo.length >= 8 && completo.length <= 15;
+  if (!ok) throw new Error("Telefone inválido. Use DDD + número, ex.: 11 91234-5678.");
+  return completo;
+};
+
+const vcardEsc = (s) => s.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/([,;])/g, "\\$1");
+
+const CONFIG = {
+  url: {
+    nome: "Site (URL)",
+    campos: [{ id: "url", rotulo: "Endereço do site", tipo: "url", placeholder: "https://exemplo.com.br" }],
+    montar(v) {
+      let u;
+      try { u = new URL(v.url.trim()); } catch { throw new Error("URL inválida."); }
+      if (!/^https?:$/.test(u.protocol)) throw new Error("A URL deve começar com http:// ou https://.");
+      return { recordType: "url", data: u.href };
+    },
+  },
+  texto: {
+    nome: "Texto",
+    campos: [{ id: "texto", rotulo: "Texto", tipo: "textarea" }],
+    montar(v) {
+      if (!v.texto.trim()) throw new Error("Digite o texto.");
+      return { recordType: "text", data: v.texto, lang: "pt" };
+    },
+  },
+  telefone: {
+    nome: "Telefone",
+    campos: [{ id: "telefone", rotulo: "Telefone com DDD", tipo: "tel", placeholder: "11 91234-5678", inputmode: "tel" }],
+    montar(v) {
+      return { recordType: "url", data: "tel:+" + fone(v.telefone) };
+    },
+  },
+  email: {
+    nome: "E-mail",
+    campos: [
+      { id: "email", rotulo: "Endereço de e-mail", tipo: "email", placeholder: "nome@exemplo.com" },
+      { id: "assunto", rotulo: "Assunto", tipo: "text", opcional: true },
+      { id: "corpo", rotulo: "Mensagem", tipo: "textarea", opcional: true },
+    ],
+    montar(v) {
+      const e = v.email.trim();
+      if (!EMAIL.test(e)) throw new Error("E-mail inválido.");
+      const q = [["subject", v.assunto], ["body", v.corpo]]
+        .filter(([, x]) => x.trim())
+        .map(([k, x]) => `${k}=${encodeURIComponent(x.trim())}`)
+        .join("&");
+      return { recordType: "url", data: `mailto:${e}${q ? "?" + q : ""}` };
+    },
+  },
+  whatsapp: {
+    nome: "WhatsApp",
+    campos: [
+      { id: "numero", rotulo: "Número com DDD", tipo: "tel", placeholder: "11 91234-5678", inputmode: "tel" },
+      { id: "mensagem", rotulo: "Mensagem", tipo: "textarea", opcional: true },
+    ],
+    montar(v) {
+      const msg = v.mensagem.trim();
+      return { recordType: "url", data: `https://wa.me/${fone(v.numero)}${msg ? "?text=" + encodeURIComponent(msg) : ""}` };
+    },
+  },
+  vcard: {
+    nome: "Contato (vCard)",
+    campos: [
+      { id: "nome", rotulo: "Nome completo", tipo: "text" },
+      { id: "telefone", rotulo: "Telefone com DDD", tipo: "tel", inputmode: "tel", opcional: true },
+      { id: "email", rotulo: "E-mail", tipo: "email", opcional: true },
+    ],
+    montar(v) {
+      const nome = v.nome.trim();
+      if (!nome) throw new Error("Informe o nome do contato.");
+      const tel = v.telefone.trim() ? fone(v.telefone) : "";
+      const email = v.email.trim();
+      if (email && !EMAIL.test(email)) throw new Error("E-mail inválido.");
+      if (!tel && !email) throw new Error("Informe telefone ou e-mail.");
+      const partes = nome.split(/\s+/);
+      const sobrenome = partes.length > 1 ? partes.pop() : "";
+      const linhas = ["BEGIN:VCARD", "VERSION:3.0", `N:${vcardEsc(sobrenome)};${vcardEsc(partes.join(" "))};;;`, `FN:${vcardEsc(nome)}`];
+      if (tel) linhas.push(`TEL;TYPE=CELL:+${tel}`);
+      if (email) linhas.push(`EMAIL:${email}`);
+      linhas.push("END:VCARD");
+      return { recordType: "mime", mediaType: "text/vcard", data: enc.encode(linhas.join("\r\n") + "\r\n") };
+    },
+  },
+};
+
+const ERROS = {
+  NotAllowedError: "Permissão negada ou NFC desligado. Ative o NFC em Configurações do aparelho e permita o acesso no Chrome. Se a tag já tem conteúdo e você desmarcou \"Sobrescrever\", marque a opção e tente de novo.",
+  NotSupportedError: "Este aparelho ou esta tag não suporta NFC/NDEF.",
+  NotReadableError: "Não foi possível acessar o NFC. Verifique se ele está ligado em Configurações > Dispositivos conectados > NFC e tente novamente.",
+  NetworkError: "A tag foi afastada cedo demais ou não é gravável (protegida, sem espaço ou incompatível). Mantenha a tag encostada no aparelho até terminar.",
+  AbortError: "Operação cancelada.",
+};
+
+const $ = (id) => document.getElementById(id);
+const tipoEl = $("tipo");
+const itens = [];
+const op = { ctrl: null };
+
+function setStatus(msg, tipo = "info") {
+  const s = $("status");
+  s.textContent = msg;
+  s.className = tipo;
+}
+
+function tratarErro(e) {
+  setStatus(ERROS[e.name] || `Erro inesperado: ${e.message || e.name}`, "err");
+}
+
+function suportado() {
+  if ("NDEFReader" in window) return true;
+  setStatus("Web NFC indisponível. Use o Chrome no Android, via HTTPS.", "err");
+  return false;
+}
+
+function atualizarBotoes() {
+  const ocupado = !!op.ctrl;
+  $("btn-ler").disabled = ocupado;
+  $("btn-gravar").disabled = ocupado;
+  $("btn-parar").disabled = !ocupado;
+  $("btn-cancelar").disabled = !ocupado;
+}
+
+function iniciar() {
+  parar(true);
+  op.ctrl = new AbortController();
+  atualizarBotoes();
+  return op.ctrl;
+}
+
+function finalizar(ctrl) {
+  if (op.ctrl !== ctrl) return;
+  op.ctrl = null;
+  atualizarBotoes();
+}
+
+function parar(silencioso) {
+  if (!op.ctrl) return;
+  op.ctrl.abort();
+  op.ctrl = null;
+  atualizarBotoes();
+  if (!silencioso) setStatus("Operação cancelada.", "info");
+}
+
+function el(tag, texto, classe) {
+  const e = document.createElement(tag);
+  if (texto !== undefined) e.textContent = texto;
+  if (classe) e.className = classe;
+  return e;
+}
+
+function botao(texto, aoClicar) {
+  const b = el("button", texto);
+  b.type = "button";
+  b.onclick = aoClicar;
+  return b;
+}
+
+/* ---------- Leitura ---------- */
+
+function decodificar(r) {
+  if (!r.data || !r.data.byteLength) return "";
+  const bytes = new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
+  const texto = (codificacao) => {
+    try { return new TextDecoder(codificacao).decode(bytes); }
+    catch { return new TextDecoder("utf-8").decode(bytes); }
+  };
+  if (r.recordType === "text") return texto(r.encoding || "utf-8");
+  if (r.recordType === "url" || r.recordType === "absolute-url") return texto("utf-8");
+  if (r.recordType === "mime" && /^text\/|json|xml|vcard/i.test(r.mediaType || "")) return texto("utf-8");
+  const hex = Array.from(bytes.slice(0, 32), (b) => b.toString(16).padStart(2, "0")).join(" ");
+  return `${bytes.length} bytes: ${hex}${bytes.length > 32 ? " …" : ""}`;
+}
+
+function linkSeguro(r, texto) {
+  if (r.recordType !== "url" && r.recordType !== "absolute-url") return null;
+  try {
+    const u = new URL(texto);
+    return /^https?:$/.test(u.protocol) ? u.href : null;
+  } catch { return null; }
+}
+
+function linha(pai, rotulo, valor) {
+  const v = el("div", valor, "v");
+  pai.append(el("div", rotulo, "k"), v);
+  return v;
+}
+
+function mostrarLeitura(message, serial) {
+  const box = $("resultado");
+  box.replaceChildren();
+  const card = el("div", undefined, "card");
+  box.append(card);
+  linha(card, "ID (serialNumber)", serial || "indisponível");
+  if (!message.records.length) {
+    linha(card, "Registros", "Tag vazia.");
+    return;
+  }
+  message.records.forEach((r, n) => {
+    const rec = el("div", undefined, "rec");
+    card.append(rec);
+    linha(rec, `Registro ${n + 1} · tipo`, r.recordType);
+    if (r.mediaType) linha(rec, "mediaType", r.mediaType);
+    if (r.recordType === "text") linha(rec, "Idioma / codificação", `${r.lang || "?"} / ${r.encoding || "utf-8"}`);
+    const conteudo = decodificar(r);
+    const v = linha(rec, "Conteúdo", conteudo || "(vazio)");
+    const href = linkSeguro(r, conteudo);
+    if (href) {
+      const a = el("a", conteudo);
+      a.href = href;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      v.replaceChildren(a);
+    }
+  });
+}
+
+async function ler() {
+  if (!suportado()) return;
+  const ctrl = iniciar();
+  setStatus("Iniciando leitura…", "info");
+  try {
+    const ndef = new NDEFReader();
+    ndef.addEventListener("reading", ({ message, serialNumber }) => {
+      mostrarLeitura(message, serialNumber);
+      setStatus("Tag lida. Aproxime outra ou toque em Parar.", "ok");
+    });
+    ndef.addEventListener("readingerror", () => {
+      setStatus("Não foi possível ler esta tag (formato não suportado ou leitura interrompida).", "err");
+    });
+    await ndef.scan({ signal: ctrl.signal });
+    if (!ctrl.signal.aborted) setStatus("Lendo… aproxime uma tag do aparelho.", "info");
+  } catch (e) {
+    if (ctrl.signal.aborted) return;
+    finalizar(ctrl);
+    tratarErro(e);
+  }
+}
+
+/* ---------- Gravação ---------- */
+
+const PREFIXOS = ["", "http://www.", "https://www.", "http://", "https://", "tel:", "mailto:"];
+const bytesDe = (d) => (typeof d === "string" ? enc.encode(d).length : d.byteLength);
+
+function tamanhoRegistro(r) {
+  let tipo;
+  let payload;
+  if (r.recordType === "text") {
+    tipo = 1;
+    payload = 1 + enc.encode(r.lang || "en").length + bytesDe(r.data);
+  } else if (r.recordType === "url") {
+    const i = PREFIXOS.findIndex((p, n) => n && r.data.startsWith(p));
+    tipo = 1;
+    payload = 1 + bytesDe(r.data) - (i > 0 ? PREFIXOS[i].length : 0);
+  } else {
+    tipo = enc.encode(r.mediaType).length;
+    payload = bytesDe(r.data);
+  }
+  return 2 + (payload < 256 ? 1 : 4) + tipo + payload;
+}
+
+function tamanhoTotal(regs) {
+  const soma = regs.reduce((t, r) => t + tamanhoRegistro(r), 0);
+  return soma + (soma < 255 ? 2 : 4) + 1;
+}
+
+function valoresDoForm() {
+  const v = {};
+  for (const c of CONFIG[tipoEl.value].campos) v[c.id] = $("c-" + c.id).value;
+  return v;
+}
+
+const preenchido = (v) => Object.values(v).some((x) => x.trim());
+
+function coletar() {
+  const regs = itens.map((i) => i.registro);
+  const v = valoresDoForm();
+  if (!preenchido(v)) return { regs, erro: null };
+  try {
+    regs.push(CONFIG[tipoEl.value].montar(v));
+    return { regs, erro: null };
+  } catch (e) {
+    return { regs, erro: e.message };
+  }
+}
+
+function atualizarEstimativa() {
+  const { regs, erro } = coletar();
+  const p = $("estimativa");
+  if (!regs.length) {
+    p.textContent = "Tamanho estimado: 0 bytes.";
+    p.className = "";
+    return;
+  }
+  const bytes = tamanhoTotal(regs);
+  let t = `${regs.length} registro(s) · tamanho estimado: ~${bytes} bytes.`;
+  if (bytes > LIMITE_BYTES) t += ` Passa de ${LIMITE_BYTES} bytes (limite de uma NTAG213).`;
+  if (erro) t += " O formulário atual ainda está inválido e não foi contado.";
+  p.textContent = t;
+  p.className = bytes > LIMITE_BYTES ? "warn" : "";
+}
+
+function renderCampos(valores = {}) {
+  const box = $("campos");
+  box.replaceChildren();
+  for (const c of CONFIG[tipoEl.value].campos) {
+    const l = el("label", c.rotulo + (c.opcional ? " (opcional)" : ""));
+    l.htmlFor = "c-" + c.id;
+    const i = document.createElement(c.tipo === "textarea" ? "textarea" : "input");
+    i.id = "c-" + c.id;
+    if (c.tipo !== "textarea") i.type = c.tipo || "text";
+    if (c.placeholder) i.placeholder = c.placeholder;
+    if (c.inputmode) i.inputMode = c.inputmode;
+    i.autocomplete = "off";
+    i.value = valores[c.id] || "";
+    box.append(l, i);
+  }
+  atualizarEstimativa();
+}
+
+function renderLista() {
+  const box = $("lista");
+  box.replaceChildren();
+  itens.forEach((it, n) => {
+    const resumo = Object.values(it.valores).filter((x) => x.trim()).join(" · ");
+    const linhaEl = el("div", undefined, "item");
+    linhaEl.append(
+      el("span", `${n + 1}. ${CONFIG[it.tipo].nome}: ${resumo}`),
+      botao("Editar", () => {
+        const [removido] = itens.splice(n, 1);
+        tipoEl.value = removido.tipo;
+        renderCampos(removido.valores);
+        renderLista();
+      }),
+      botao("Remover", () => {
+        itens.splice(n, 1);
+        renderLista();
+      })
+    );
+    box.append(linhaEl);
+  });
+  atualizarEstimativa();
+}
+
+function adicionar() {
+  const valores = valoresDoForm();
+  try {
+    const registro = CONFIG[tipoEl.value].montar(valores);
+    itens.push({ tipo: tipoEl.value, valores, registro });
+    renderCampos();
+    renderLista();
+    setStatus("Registro adicionado à lista.", "info");
+  } catch (e) {
+    setStatus(e.message, "err");
+  }
+}
+
+async function gravar() {
+  if (!suportado()) return;
+  const { regs, erro } = coletar();
+  if (erro) return setStatus(erro, "err");
+  if (!regs.length) return setStatus("Preencha o conteúdo a gravar.", "err");
+  const bytes = tamanhoTotal(regs);
+  if (bytes > LIMITE_BYTES && !confirm(`Tamanho estimado: ~${bytes} bytes, acima de ${LIMITE_BYTES} (limite de uma NTAG213). Gravar mesmo assim?`)) {
+    return setStatus("Gravação cancelada.", "info");
+  }
+  const ctrl = iniciar();
+  setStatus("Aproxime a tag do aparelho para gravar…", "info");
+  try {
+    await new NDEFReader().write({ records: regs }, { overwrite: $("overwrite").checked, signal: ctrl.signal });
+    setStatus("Tag gravada com sucesso.", "ok");
+  } catch (e) {
+    if (!ctrl.signal.aborted) tratarErro(e);
+  } finally {
+    finalizar(ctrl);
+  }
+}
+
+/* ---------- Inicialização ---------- */
+
+for (const [chave, t] of Object.entries(CONFIG)) tipoEl.append(new Option(t.nome, chave));
+tipoEl.onchange = () => renderCampos();
+$("campos").addEventListener("input", atualizarEstimativa);
+$("btn-add").onclick = adicionar;
+$("btn-ler").onclick = ler;
+$("btn-gravar").onclick = gravar;
+$("btn-parar").onclick = () => parar();
+$("btn-cancelar").onclick = () => parar();
+
+for (const nome of ["ler", "gravar"]) {
+  $("tab-" + nome).onclick = () => {
+    parar(true);
+    for (const n of ["ler", "gravar"]) {
+      $("tab-" + n).setAttribute("aria-selected", n === nome);
+      $("painel-" + n).hidden = n !== nome;
+    }
+    setStatus("Pronto.", "info");
+  };
+}
+
+renderCampos();
+renderLista();
+if (suportado()) {
+  setStatus("Pronto. Escolha uma aba.", "info");
+} else {
+  $("btn-ler").disabled = true;
+  $("btn-gravar").disabled = true;
+}
+</script>
+</body>
+</html>
